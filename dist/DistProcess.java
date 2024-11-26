@@ -12,6 +12,8 @@ import java.net.*;
 
 //To get the process id.
 import java.lang.management.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.apache.zookeeper.*;
 import org.apache.zookeeper.ZooDefs.Ids;
@@ -19,7 +21,9 @@ import org.apache.zookeeper.KeeperException.*;
 import org.apache.zookeeper.data.*;
 import org.apache.zookeeper.KeeperException.Code;
 
-// TODO
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 // Replace XX with your group number.
 // You may have to add other interfaces such as for threading, etc., as needed.
 // This class will contain the logic for both your manager process as well as the worker processes.
@@ -39,7 +43,9 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 	boolean initialized=false;
 
 	Queue<String> available_workers;
-
+	Set<String> all_tasks;
+	Queue<String> pending_tasks;
+	private final ExecutorService workerPool = Executors.newCachedThreadPool(); // Dynamic thread pool
 	DistProcess(String zkhost)
 	{
 		zkServer=zkhost;
@@ -59,8 +65,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 		{
 			runForManager();	// See if you can become the manager (i.e, no other manager exists)
 			isManager=true;
-			getTasks(); // Install monitoring on any new tasks that will be created.
-									// TODO monitor for worker tasks?
+//			getTasks(); // Install monitoring on any new tasks that will be created.
 		}catch(NodeExistsException nee)
 		{
 			isManager=false;
@@ -91,18 +96,30 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 	void runForManager() throws UnknownHostException, KeeperException, InterruptedException
 	{
 		//Try to create an ephemeral node to be the manager, put the hostname and pid of this process as the data.
-		// This is an example of Synchronous API invocation as the function waits for the execution and no callback is involved..
-		zk.create("/dist23/manager", pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
-		zk.create("/dist23/workers", "0".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-		zk.exists("/dist23/workers", this);
+		// This is an example of Synchronous API invocation as the function waits for the execution and no callback is involved
+        try {
+            zk.create("/dist23", pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (Exception e) {
+			//do nothing
+		}
+        zk.create("/dist23/manager", pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		zk.addWatch("/dist23/manager", this, AddWatchMode.PERSISTENT);
+		zk.create("/dist23/workers", null, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		zk.create("/dist23/tasks",null, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		zk.addWatch("/dist23/tasks", this, AddWatchMode.PERSISTENT);
+
 		available_workers = new LinkedList<>();
+		pending_tasks = new LinkedList<>();
+		all_tasks = new HashSet<>();
 	}
 
 	void runForWorker() throws UnknownHostException, KeeperException, InterruptedException
 	{
 		//Try to create an ephemeral node to be the manager, put the hostname and pid of this process as the data.
 		// This is an example of Synchronous API invocation as the function waits for the execution and no callback is involved..
-		zk.create("/dist23/workers/worker-" , "idle".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+		zk.create("/dist23/workers/worker-" + pinfo, pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		zk.addWatch("/dist23/workers/worker-" + pinfo, this, AddWatchMode.PERSISTENT);
+		zk.create("/dist23/manager/worker-" + pinfo, pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
 	}
 
 
@@ -130,10 +147,6 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 			}
 		}
 
-		if(e.getType() == Watcher.Event.EventType.NodeChildrenChanged && e.getPath().equals("/dist23/workers")) {
-			getWorkers();
-		}
-
 		// Manager should be notified if any new znodes are added to tasks.
 		if(e.getType() == Watcher.Event.EventType.NodeChildrenChanged && e.getPath().equals("/dist23/tasks"))
 		{
@@ -141,77 +154,143 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 			// We are going to re-install the Watch as well as request for the list of the children.
 			getTasks();
 		}
+
+		if(e.getType() == Watcher.Event.EventType.NodeChildrenChanged && e.getPath().equals("/dist23/manager"))
+		{
+			// There has been changes to the children of the node.
+			// We are going to re-install the Watch as well as request for the list of the children.
+			getAvailableWorkers();
+		}
+
+		if(e.getType() == Watcher.Event.EventType.NodeChildrenChanged && e.getPath().equals("/dist23/workers/worker-" + pinfo))
+		{
+			// There has been changes to the children of the node.
+			// We are going to re-install the Watch as well as request for the list of the children.
+			getAssignedTask();
+		}
 	}
 
-	private void getWorkers() {
-		zk.getChildren("/dist23/workers", this, this, null);
+	void getAssignedTask() {
+		zk.getChildren("/dist23/workers/worker-" + pinfo, this, this, null);
+	}
+
+	void getAvailableWorkers() {
+		zk.getChildren("/dist23/manager", this, this, null);
+	}
+
+	void processTask(byte[] taskSerial, String task) {
+		workerPool.submit(() -> { // Submit task to the thread pool
+			try {
+				ByteArrayInputStream bis = new ByteArrayInputStream(taskSerial);
+				ObjectInput in = new ObjectInputStream(bis);
+				DistTask dt = (DistTask) in.readObject();
+
+				dt.compute(); // Perform time-consuming computation
+
+				// Serialize result and update ZooKeeper
+				ByteArrayOutputStream bos = new ByteArrayOutputStream();
+				ObjectOutputStream oos = new ObjectOutputStream(bos);
+				oos.writeObject(dt);
+				oos.flush();
+				byte[] taskResult = bos.toByteArray();
+
+				zk.create("/dist23/tasks/" + task + "/result", taskResult, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+				zk.create("/dist23/manager/worker-" + pinfo, pinfo.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+				zk.delete("/dist23/workers/worker-" + pinfo +"/" + task, -1, null, null);
+				System.out.println("Task " + task + " completed by worker.");
+			} catch (Exception e) {
+				System.err.println("Error processing task: " + e.getMessage());
+			}
+		});
 	}
 
 	//Asynchronous callback that is invoked by the zk.getChildren request.
 	public void processResult(int rc, String path, Object ctx, List<String> children)
 	{
-
-		//!! IMPORTANT !!
-		// Do not perform any time consuming/waiting steps here
-		//	including in other functions called from here.
-		// 	Your will be essentially holding up ZK client library 
-		//	thread and you will not get other notifications.
-		//	Instead include another thread in your program logic that
-		//   does the time consuming "work" and notify that thread from here.
-
-		// This logic is for manager !!
-		//Every time a new task znode is created by the client, this will be invoked.
-
-		// TODO: Filter out and go over only the newly created task znodes.
-		//		Also have a mechanism to assign these tasks to a "Worker" process.
-		//		The worker must invoke the "compute" function of the Task send by the client.
-		//What to do if you do not have a free worker process?
 		System.out.println("DISTAPP : processResult : " + rc + ":" + path + ":" + ctx);
-		for(String c: children)
-		{
-			System.out.println(c);
-			try
-			{
-				//TODO There is quite a bit of worker specific activities here,
-				// that should be moved done by a process function as the worker.
-
-				//TODO!! This is not a good approach, you should get the data using an async version of the API.
-				byte[] taskSerial = zk.getData("/dist23/tasks/"+c, false, null);
-
-				// Re-construct our task object.
-				ByteArrayInputStream bis = new ByteArrayInputStream(taskSerial);
-				ObjectInput in = new ObjectInputStream(bis);
-				DistTask dt = (DistTask) in.readObject();
-
-				//Execute the task.
-				//TODO: Again, time consuming stuff. Should be done by some other thread and not inside a callback!
-				dt.compute();
-				
-				// Serialize our Task object back to a byte array!
-				ByteArrayOutputStream bos = new ByteArrayOutputStream();
-				ObjectOutputStream oos = new ObjectOutputStream(bos);
-				oos.writeObject(dt); oos.flush();
-				taskSerial = bos.toByteArray();
-				// Store it inside the result node.
-				zk.create("/dist23/tasks/"+c+"/result", taskSerial, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-				//zk.create("/dist23/tasks/"+c+"/result", ("Hello from "+pinfo).getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		if (path.equals("/dist23/manager")) {
+			for (String child: children) {
+				zk.delete("/dist23/manager/" + child, -1, null, null);
+				if (pending_tasks.size() != 0) {
+					String task = pending_tasks.poll();
+                    try {
+                        zk.create("/dist23/workers/" + child + "/" + task, null, Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+                    } catch (KeeperException e) {
+                        throw new RuntimeException(e);
+                    } catch (InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }else {
+					available_workers.offer(child);
+				}
 			}
-			catch(NodeExistsException nee){System.out.println(nee);}
-			catch(KeeperException ke){System.out.println(ke);}
-			catch(InterruptedException ie){System.out.println(ie);}
-			catch(IOException io){System.out.println(io);}
-			catch(ClassNotFoundException cne){System.out.println(cne);}
+		}
+
+		if (path.equals("/dist23/tasks")) {
+			for (String task : children) {
+				if (!all_tasks.contains(task)) {
+					all_tasks.add(task);
+					if (available_workers.size() != 0) {
+						String worker = available_workers.poll();
+						try {
+							zk.create("/dist23/workers/" + worker + "/" + task, "0".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+							zk.delete("/dist23/manager/" + worker, -1, null, null);
+						} catch (InterruptedException e) {
+                            throw new RuntimeException(e);
+                        } catch (KeeperException e) {
+                            throw new RuntimeException(e);
+                        }
+                    } else {
+						pending_tasks.offer(task);
+					}
+				} else {
+					// old task... skipped
+				}
+			}
+		}
+
+		if (path.equals("/dist23/workers/worker-" + pinfo)) {
+			if (children.size() > 0) {
+				String task = children.get(0);
+				zk.getData("/dist23/tasks/" + task, false, (rc1, path1, ctx1, data, stat) -> {
+					if (rc1 == Code.OK.intValue()) {
+	//						System.out.println("Task data retrieved for: " + path);
+						processTask(data, task);
+					} else {
+						System.err.println("Error retrieving task data for: " + path1 + ". Code: " + rc1);
+					}
+				}, null);
+			}
 		}
 	}
 
-	public static void main(String args[]) throws Exception
-	{
-		//Create a new process
-		//Read the ZooKeeper ensemble information from the environment variable.
+	public static void main(String[] args) throws Exception {
+		// Create a new process
+		// Read the ZooKeeper ensemble information from the environment variable.
 		DistProcess dt = new DistProcess(System.getenv("ZKSERVER"));
 		dt.startProcess();
 
-		//Replace this with an approach that will make sure that the process is up and running forever.
-		Thread.sleep(20000); 
+		// Set up a latch to keep the process running
+		CountDownLatch latch = new CountDownLatch(1);
+		AtomicBoolean isRunning = new AtomicBoolean(true);
+
+		// Add a shutdown hook to handle graceful termination
+		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+			System.out.println("Shutting down process...");
+			isRunning.set(false);
+			latch.countDown(); // Release the latch
+			try {
+				if (dt.zk != null) {
+					dt.zk.close(); // Close ZooKeeper connection
+				}
+			} catch (Exception e) {
+				System.err.println("Error while closing ZooKeeper: " + e.getMessage());
+			}
+			System.out.println("Process terminated.");
+		}));
+
+		// Keep the main thread alive
+		System.out.println("Process is up and running. Use 'kill' to terminate.");
+		latch.await();
 	}
 }
