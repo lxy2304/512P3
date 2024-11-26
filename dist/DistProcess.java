@@ -208,6 +208,10 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 	public void processResult(int rc, String path, Object ctx, List<String> children)
 	{
 		System.out.println("DISTAPP : processResult : " + rc + ":" + path + ":" + ctx);
+		for (String s: children) {
+			System.out.print(s + ", ");
+		}
+		System.out.println();
 		if (path.equals("/dist23/manager")) {
 			for (String child: children) {
 				zk.delete("/dist23/manager/" + child, -1, null, null);
@@ -220,7 +224,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
                     } catch (InterruptedException e) {
                         throw new RuntimeException(e);
                     }
-                }else {
+                } else {
 					available_workers.offer(child);
 				}
 			}
@@ -264,6 +268,17 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 		}
 	}
 
+	public void deleteRecursive(String path) throws KeeperException, InterruptedException {
+		// Get the list of children for the node
+		for (String child : zk.getChildren(path, false)) {
+			// Recursively delete children
+			deleteRecursive(path + "/" + child);
+		}
+		// Delete the node itself
+		zk.delete(path, -1);
+		System.out.println("Deleted: " + path);
+	}
+
 	public static void main(String[] args) throws Exception {
 		// Create a new process
 		// Read the ZooKeeper ensemble information from the environment variable.
@@ -281,6 +296,7 @@ public class DistProcess implements Watcher, AsyncCallback.ChildrenCallback
 			latch.countDown(); // Release the latch
 			try {
 				if (dt.zk != null) {
+					if (dt.isManager) dt.deleteRecursive("/dist23");
 					dt.zk.close(); // Close ZooKeeper connection
 				}
 			} catch (Exception e) {
